@@ -78,9 +78,10 @@ This project wouldn't be possible without the incredible work of:
 - **[Salvo Giangreco](https://github.com/salvogiangri)** - The man behind the **[UN1CA](https://github.com/salvogiangri/UN1CA)** project and a true leader in the Samsung community. The initial ideas and inspiration that made AstroROM possible. 
 - **[BlassGO](https://github.com/BlassGO)** - For his Dynamic Installer.
 - **[Danda420](https://github.com/Danda420)** - For his genfscontexts.
-- **[jesec](https://github.com/jesec)** - For samfirm.js , which we use to download the latest firmwares.
+- **[jesec](https://github.com/jesec)** - For samfirm.js , which we use to download the latest firmwares, updated by @sameeralsahab
 - **[3arthur6](https://github.com/3arthur6)** - For bluetooth library patcher.
 - **[soulr344](https://github.com/soulr344/OMCDecoder)** - For omc decoder.
+- **[MianHamza](t.me/@Code_by_Mian)** - For making the script work on sm8250.
 ---
 
 ## Licensing
