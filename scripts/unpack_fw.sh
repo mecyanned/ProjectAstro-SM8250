@@ -74,7 +74,8 @@ EXTRACT_FIRMWARE()
 # ]
 
     LOG_INFO "Unpacking $MODEL_NAME firmware..."
-    rm -rf "${WORK_DIR:?}"/*
+    # Keep existing unpacked data - only remove super.img and temp files
+    rm -f "${WORK_DIR}/super.img" "${WORK_DIR}"/*.img.tmp 2>/dev/null
     mkdir -p "$WORK_DIR"
 
 
@@ -93,12 +94,12 @@ EXTRACT_FIRMWARE()
     SPARSE_TO_RAW "$SUPER_IMG" \
     || ERROR_EXIT "Sparse conversion failed for super.img"
 
-	# [ Get super image metadata and unpack the super image
+ # [ Get super image metadata and unpack the super image
     #https://source.android.com/docs/core/ota/dynamic_partitions
     if [[ ! -f "$CONF_FILE" ]]; then
         local LPDUMP_OUT
         LPDUMP_OUT=$("$PREBUILTS/android-tools/lpdump" "$SUPER_IMG" 2>&1) || {
-            rm -f "$CONF_FILE" "$MARKER_FILE"
+            # Don't delete config/marker files - preserve extraction state for debugging
             ERROR_EXIT "Failed to generate super metadata for $model"
         }
 
@@ -106,8 +107,7 @@ EXTRACT_FIRMWARE()
         SUPER_SIZE=$(echo "$LPDUMP_OUT" | awk '/Partition name: super/,/Flags:/ {if ($1 == "Size:") {print $2; exit}}')
         METADATA_SIZE=$(echo "$LPDUMP_OUT" | awk '/Metadata max size:/ {print $4}')
         METADATA_SLOTS=$(echo "$LPDUMP_OUT" | awk '/Metadata slot count:/ {print $4}')
-
-        read -r GROUP_NAME GROUP_SIZE <<< $(echo "$LPDUMP_OUT" | awk '
+		read -r GROUP_NAME GROUP_SIZE <<< $(echo "$LPDUMP_OUT" | awk '
             /Group table:/ {in_table=1}
             in_table && /Name:/ {name=$2}
             in_table && /Maximum size:/ {size=$3; if(size+0 > 0){print name, size; exit}}
@@ -115,8 +115,8 @@ EXTRACT_FIRMWARE()
 
         if [[ -n "$SUPER_SIZE" && -n "$GROUP_NAME" ]]; then
 
-		cat > "$CONF_FILE" <<EOF
-METADATA="$METADATA"
+  cat > "$CONF_FILE" <<EOF
+METADATA="$FILE_STATE"
 SUPER_SIZE="$SUPER_SIZE"
 METADATA_SIZE="$METADATA_SIZE"
 METADATA_SLOTS="$METADATA_SLOTS"
@@ -138,7 +138,14 @@ EOF
 
     local FOUND_PART_COUNT=0
     for PART in "${TARGET_PARTITIONS[@]}"; do
-	#https://source.android.com/docs/core/ota/ab
+ #https://source.android.com/docs/core/ota/ab
+        # Skip if partition is already extracted
+        if [[ -d "${WORK_DIR}/${PART}" ]] && [[ -f "${CONFIG_DIR}/${PART}_fs_config" ]]; then
+            LOG_INFO "Skipping $PART (already extracted)"
+            ((FOUND_PART_COUNT++))
+            continue
+        fi
+
         for SUFFIX in "_a" ""; do
             local SRC_IMG="${WORK_DIR}/${PART}${SUFFIX}.img"
             local DST_IMG="${WORK_DIR}/${PART}.img"
@@ -152,13 +159,20 @@ EOF
             fi
         done
     done
-	# Remove empty B slots (Virtual A/B)
+ # Remove empty B slots (Virtual A/B)
     find "$WORK_DIR" -maxdepth 1 -type f -name "*_b.img" -delete
 
 
     # [ CSC Partitions
     if [[ -n "$CSC_PACKAGE" ]]; then
         for PART in "${CSC_SUB_PARTITIONS[@]}"; do
+            # Skip if CSC partition is already extracted
+            if [[ -d "${WORK_DIR}/${PART}" ]] && [[ -f "${CONFIG_DIR}/${PART}_fs_config" ]]; then
+                LOG_INFO "Skipping $PART (already extracted)"
+                ((FOUND_PART_COUNT++))
+                continue
+            fi
+
             local IMG_PATH="${WORK_DIR}/${PART}.img"
             if FETCH_FILE "$CSC_PACKAGE" "${PART}.img" "$WORK_DIR" >/dev/null 2>&1; then
                 SPARSE_TO_RAW "$IMG_PATH" \
@@ -200,25 +214,34 @@ UNPACK_PARTITION()
     case "$FS_TYPE" in
         "ext4") mount -o ro "$IMAGE_PATH" "$MNT" ;;
         "erofs") SILENT "$PREBUILTS/erofs-utils/fuse.erofs" "$IMAGE_PATH" "$MNT" ;;
-        "f2fs") [[ ! IS_WSL ]] && mount -o ro "$IMAGE_PATH" "$MNT" ;;
+        "f2fs") if ! IS_WSL; then
+                    mount -o ro "$IMAGE_PATH" "$MNT" \
+                        || ERROR_EXIT "Failed to mount f2fs image: $IMAGE_PATH (is the f2fs kernel module loaded?)"
+                fi ;;
         *)      ERROR_EXIT "Unsupported filesystem: $FS_TYPE"; return 1 ;;
     esac
 
 
     cp -a -T "$MNT" "$DEST_DIR"
+	# Android partition dirs are often drwx------ (mode 700, uid 0).
+    # Make every directory traversable and every file readable so the
+    # build user (SUDO_USER) can access the extracted tree.
+    chmod -R a+rX "$DEST_DIR"
+    local _BUILD_USER="${SUDO_USER:-$(whoami)}"
+    chown -R "${_BUILD_USER}:${_BUILD_USER}" "$DEST_DIR" 2>/dev/null || true
 
     # Generate Linux perms & SELinux contexts
-	#https://source.android.com/docs/security/features/selinux
-	#https://source.android.com/docs/security/features/selinux/implement
+ #https://source.android.com/docs/security/features/selinux
+ #https://source.android.com/docs/security/features/selinux/implement
     LOG_INFO "Extracting links, modes & attrs from $PART_NAME"
 
-	# Generate fs_config: UID, GID, permissions, capabilities
+ # Generate fs_config: UID, GID, permissions, capabilities
     # Format: <path> <uid> <gid> <mode> capabilities=<capability_mask>
     find "$MNT" | xargs stat -c "%n %u %g %a capabilities=0x0" > "$FS_CONFIG"
 
-	# Generate file_contexts: SELinux security contexts
+ # Generate file_contexts: SELinux security contexts
     # Format: <path> <selinux_context>
-    find "$MNT" | xargs -I {} sh -c 'echo "{} $(getfattr -n security.selinux --only-values -h --absolute-names "{}")"' sh > "$FILE_CONT"
+    find "$MNT" | xargs -I {} sh -c 'echo "{} $(getfattr -n security.selinux --only-values -h --absolute-names "{}" 2>/dev/null)"' sh > "$FILE_CONT"
 
     sort -o "$FS_CONFIG" "$FS_CONFIG"
     sort -o "$FILE_CONT" "$FILE_CONT"
@@ -229,7 +252,7 @@ UNPACK_PARTITION()
         sed -i -e "s|$MNT |/ |g" -e "s|$MNT||g" "$FILE_CONT"
         sed -i -e "s|$MNT | |g" -e "s|$MNT/||g" "$FS_CONFIG"
     else
-	    # Other common partition layout [PART_NAME/]
+     # Other common partition layout [PART_NAME/]
         sed -i "s|$MNT|/$PART_NAME|g" "$FILE_CONT"
         sed -i -e "s|$MNT | |g" -e "s|$MNT|$PART_NAME|g" "$FS_CONFIG"
         sed -i '1s|^|/ |' "$FS_CONFIG"
@@ -237,7 +260,9 @@ UNPACK_PARTITION()
 
     # Escape Regex metacharacters
     sed -i -E 's/([][()+*.^$?\\|])/\\\1/g' "$FILE_CONT"
-    sed -i "/^PARTITIONS=/s/\"$/ $PART_NAME\"/" "$UNPACK_CONF"
+    if [[ -f "$UNPACK_CONF" ]]; then
+        sed -i "/^PARTITIONS=/s/\"$/ $PART_NAME\"/" "$UNPACK_CONF"
+    fi
     # ]
 }
 
@@ -274,13 +299,20 @@ EXTRACT_ROM() {
         IFS=":" read -r m c type <<< "$entry"
         [[ -z "$m" || -z "$c" ]] && continue
 
-        DOWNLOAD_FW "$type" || ERROR_EXIT "Firmware download failed"
-
         local fw_id="${m}_${c}"
         if [[ "$processed" =~ "$fw_id" ]]; then
             continue
         fi
 
+        # Skip download and extraction if already unpacked by checking for marker
+        local MARKER_FILE="${WORKDIR}/${m}/.extraction_complete"
+        if [[ -f "$MARKER_FILE" ]]; then
+            LOG_INFO "Firmware for $m already unpacked. Skipping download and extraction."
+            processed+="$fw_id "
+            continue
+        fi
+
+        DOWNLOAD_FW "$type" || ERROR_EXIT "Firmware download failed"
 
         if [[ "$type" == "main" && "$BETA_ASSERT" == "1" ]]; then
             PATCH_BETA_FW "$m" "$c" || return 1
