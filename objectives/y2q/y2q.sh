@@ -31,7 +31,7 @@ STOCK_IMEI="352622117031190"
 
 # Source firmware details
 MODEL="SM-S908E"
-CSC="XTC"
+CSC="XSG"
 IMEI="352404911234563"
 
 # Extra firmware (Optional) details
